@@ -3,6 +3,11 @@ name = "class_file"
 version = "0.1.0"
 authors = ["Jezza <jezzadabomb@gmail.com>"]
 edition = "2018"
+description = "A library for parsing JVM classfiles."
+readme = "README.md"
+license = "MIT"
+repository = "https://github.com/Jezza/class_file"
+keywords = ["jvm", "class", "classfile", "parse", "bytecode"]
 
 [dependencies]
 nom = "4.1"
