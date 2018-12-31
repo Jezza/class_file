@@ -1,0 +1,10 @@
+[package]
+name = "class_file"
+version = "0.1.0"
+authors = ["Jezza <jezzadabomb@gmail.com>"]
+edition = "2018"
+
+[dependencies]
+nom = "4.1"
+mutf8 = "0.1"
+#mutf8 = {path = "../mutf8"}
