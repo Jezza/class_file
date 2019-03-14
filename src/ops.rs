@@ -8,6 +8,8 @@
 //    };
 //}
 
+pub const MAGIC: [u8; 4] = [0xCA, 0xFE, 0xBA, 0xBE];
+
 // ASM API versions.
 
 //const ASM4: u8 = 4 << 16 | 0 << 8;

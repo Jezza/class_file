@@ -3,13 +3,19 @@ name = "class_file"
 version = "0.1.0"
 authors = ["Jezza <jezzadabomb@gmail.com>"]
 edition = "2018"
-description = "A library for parsing JVM classfiles."
+description = "A library for parsing JVM class files."
 readme = "README.md"
 license = "MIT"
 repository = "https://github.com/Jezza/class_file"
-keywords = ["jvm", "class", "classfile", "parse", "bytecode"]
+keywords = ["jvm", "class", "classfile", "parser", "bytecode"]
 
 [dependencies]
-nom = "4.1"
-mutf8 = "0.1"
-#mutf8 = {path = "../mutf8"}
+#mutf8 = "0.2"
+mutf8 = {path = "../mutf8"}
+binform = {path = "../binform/binform"}
+
+paste = "0.1.4"
+
+#nom = "4.1"
+#byteorder = "1.2"
+#bytes = "0.4"

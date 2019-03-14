@@ -1,292 +1,215 @@
-#[macro_use]
-extern crate nom;
-
+extern crate binform;
 extern crate mutf8;
 
-#[macro_use]
-mod parsing;
+use std::convert::TryInto;
+use std::marker::PhantomData;
+
+use binform::*;
+pub use binform::{
+	ToBytes,
+	FromBytes
+};
+pub use mutf8::{mstr, MString};
+
+use crate::attr::Attribute;
+use crate::ops::*;
 
 pub mod ops;
 pub mod attr;
+pub mod macros;
 
-use nom::*;
-pub use mutf8::{MString, mstr};
-pub use nom::Err as Err;
+const MAGIC: u32 = 0xCAFE_BABE;
 
-use crate::ops::*;
-use crate::attr::Attribute;
-
-#[derive(Debug, Eq, PartialEq, Hash, Clone)]
-pub struct ClassFile<'a> {
-	pub minor_version: u16,
-	pub major_version: u16,
-	pub constant_pool: ConstantPool<'a>,
-	pub access_flags: u16,
-	pub this_class: CPIndex<'a, ClassInfo<'a>>,
-	pub super_class: CPIndex<'a, ClassInfo<'a>>,
-	pub interfaces: Vec<CPIndex<'a, ClassInfo<'a>>>,
-	pub fields: Vec<FieldInfo<'a>>,
-	pub methods: Vec<MethodInfo<'a>>,
-	pub attributes: Attributes<'a>,
+def! {
+	struct ClassFile('a) {
+		#[binform(before(expect(ty = "u32", value = "MAGIC")))]
+		minor_version: u16,
+		major_version: u16,
+		constant_pool: ConstantPool<'a>,
+		access_flags: u16,
+		this_class: CPIndex<'a, ClassInfo<'a>>,
+		super_class: CPIndex<'a, ClassInfo<'a>>,
+		#[binform(len = "u16")]
+		interfaces: Vec<CPIndex<'a, ClassInfo<'a>>>,
+		#[binform(len = "u16")]
+		fields: Vec<FieldInfo<'a>>,
+		#[binform(len = "u16")]
+		methods: Vec<MethodInfo<'a>>,
+		attributes: Attributes<'a>,		
+	}
 }
 
 impl<'a> ClassFile<'a> {
-	named!(pub parse<ClassFile>, do_parse!(
-		tag!([0xCA, 0xFE, 0xBA, 0xBE]) >>
-		minor_version: be_u16 >>
-		major_version: be_u16 >>
-		constant_pool: pt!(ConstantPool) >>
-		access_flags: be_u16 >>
-		this_class: pt!(CPIndex) >>
-		super_class: pt!(CPIndex) >>
-		interfaces: length_count!(be_u16, pt!(CPIndex)) >>
-		fields: length_count!(be_u16, pt!(FieldInfo)) >>
-		methods: length_count!(be_u16, pt!(MethodInfo)) >>
-		attributes: pt!(Attributes) >>
-		(ClassFile {
-			minor_version,
-			major_version,
-			constant_pool,
-			access_flags,
-			this_class,
-			super_class,
-			interfaces,
-			fields,
-			methods,
-			attributes,
-		})
-	));
+	pub fn open<I: Read>(input: &mut I) -> ReadResult<ClassFile> {
+		ClassFile::from_bytes(input)
+	}
 }
 
+def! {
+	struct ConstantPool('a) {
+		#[binform(read = "read_constant_pool", write = "write_constant_pool")]
+		entries: Vec<CPEntry<'a>>,
+	}
+}
 
-#[derive(Debug, Eq, PartialEq, Hash, Clone)]
-pub struct ConstantPool<'a> {
-	pub entries: Vec<CPEntry<'a>>,
+fn read_constant_pool<'a, I: Read, BO: ByteOrder, L>(input: &mut I) -> ReadResult<Vec<CPEntry<'a>>> {
+	let len = input.read_u16::<BO>()? - 1;
+	let mut result = Vec::with_capacity(len as usize);
+	for _ in 0..len {
+		result.push(CPEntry::from_bytes(input)?);
+	}
+	Ok(result)
+}
+
+fn write_constant_pool<'a, O: Write, BO: ByteOrder, L>(value: &Vec<CPEntry<'a>>, output: &mut O) -> WriteResult {
+	let len = value.len() + 1;
+	if len > u16::max_value() as usize {
+		return Err(WriteError::TooLarge(len));
+	}
+	output.write_u16::<BO>(len as u16)?;
+	for e in value {
+		e.to_bytes(output)?;
+	}
+	Ok(())
 }
 
 impl<'a> ConstantPool<'a> {
-	named!(pub parse<ConstantPool>, do_parse!(
-		entries: length_count!(do_parse!(
-			count: be_u16 >>
-			(count - 1)
-		), pt!(CPEntry)) >>
-		(ConstantPool {
-			entries,
-		})
-	));
-
 	pub fn index<T: 'a + CPType<'a>>(&'a self, index: CPIndex<'a, T>) -> Option<T::Output> {
 		let entry = &self.entries[(index.index - 1) as usize];
 		T::fetch(entry)
 	}
 }
 
-#[derive(Debug, Eq, PartialEq, Hash, Clone)]
-pub enum CPEntry<'a> {
-	Class(ClassInfo<'a>),
-	FieldRef(FieldRefInfo<'a>),
-	MethodRef(MethodRefInfo<'a>),
-	InterfaceMethodRef(InterfaceMethodRefInfo<'a>),
-	String(StringInfo<'a>),
-	Integer(IntegerInfo),
-	Float(FloatInfo),
-	Long(LongInfo),
-	Double(DoubleInfo),
-	NameAndType(NameAndTypeInfo<'a>),
-	UTF8(UTF8Info<'a>),
-	MethodHandle(MethodHandleInfo<'a>),
-	MethodType(MethodTypeInfo<'a>),
-	Dynamic(DynamicInfo<'a>),
-	InvokeDynamic(InvokeDynamicInfo<'a>),
-	Module(ModuleInfo<'a>),
-	Package(PackageInfo<'a>),
-}
+impl<'a> IntoIterator for ConstantPool<'a> {
+	type Item = CPEntry<'a>;
+	type IntoIter = ::std::vec::IntoIter<CPEntry<'a>>;
 
-macro_rules! def_fetch {
-    ($type:ident <$first:lifetime $(,$rest:lifetime)*> => $deconstruct:ident) => {
-		impl <$first $(,$rest)*> CPType<$first> for $type <$first $(,$rest)*> {
-			type Output = & $first Self;
-			
-			#[inline]
-			fn fetch(entry: & $first CPEntry< $first >) -> Option<Self::Output> {
-				if let CPEntry::$deconstruct(info) = entry {
-					Some(info)
-				} else {
-					None
-				}
-			}
-		}
-    };
-    ($type:ident => $deconstruct:ident) => {
-		impl <'a> CPType<'a> for $type {
-			type Output = &'a Self;
-			
-			#[inline]
-			fn fetch(entry: &'a CPEntry<'a>) -> Option<Self::Output> {
-				if let CPEntry::$deconstruct(info) = entry {
-					Some(info)
-				} else {
-					None
-				}
-			}
-		}
-    };
-}
-
-macro_rules! cp_entry {
-	(struct $type:ident $(<$first:lifetime $(,$rest:lifetime)*>)? {
-		$($field_name:ident: $field_type:ty = ($($field_parser:tt)*)),* $(,)?
-	} => $deconstruct:ident) => {
-		parser! {
-			struct $type $(<$first $(,$rest)*>)? {
-				$($field_name: $field_type = ($($field_parser)*)),*
-			}
-		}
-		def_fetch!($type $(<$first $(,$rest)*>)? => $deconstruct);
-    };
-    (enum $type:ident $(<$first:lifetime $(,$rest:lifetime)*>)? = ($ident:ident: $($tag_parser:tt)*) {
-		$(
-			$variant:ident ($($variant_tag:tt)*) {
-				$($field_name:ident: $field_type:ty = ($($field_parser:tt)*)),* $(,)?
-			}
-		),* $(,)?
-	} => $deconstruct:ident) => {
-		parser! {
-			enum $type $(<$first $(,$rest)*>)? = ($ident: $($tag_parser)*) {
-				$(
-					$variant ($($variant_tag)*) {
-						$($field_name: $field_type = ($($field_parser)*)),*
-					}
-				),*
-			}
-		}
-
-		def_fetch!($type $(<$first $(,$rest)*>)? => $deconstruct);
+	fn into_iter(self) -> Self::IntoIter {
+		self.entries.into_iter()
 	}
 }
 
-cp_entry! {
-	struct ClassInfo<'a> {
-		name_index: CPIndex<'a, UTF8Info<'a>> = (pt!(CPIndex))
-	} => Class
+impl<'a, 'b> IntoIterator for &'b ConstantPool<'a> {
+	type Item = &'b CPEntry<'a>;
+	type IntoIter = ::std::slice::Iter<'b, CPEntry<'a>>;
+
+	fn into_iter(self) -> Self::IntoIter {
+		self.entries.iter()
+	}
 }
 
-cp_entry! {
-	struct FieldRefInfo<'a> {
-		class_index: CPIndex<'a, ClassInfo<'a>> = (pt!(CPIndex)),
-		name_and_type_index: CPIndex<'a, NameAndTypeInfo<'a>> = (pt!(CPIndex))
-	} => FieldRef
+macro_rules! def_fetch {
+	(
+		$name:ident $( ( $($generics:tt)* ) )? => $into:ident
+	) => {
+		impl <'a, $( $($generics),* )?> CPType<'a> for $name $( < $($generics),* > )? {
+			type Output = &'a Self;
+
+			#[inline]
+			fn fetch(entry: &'a CPEntry<'a>) -> Option<Self::Output> {
+				if let CPEntry::$into(value) = entry {
+					Some(value)
+				} else {
+					None
+				}
+			}
+		}
+	}
 }
 
-cp_entry! {
-	struct MethodRefInfo<'a> {
-		class_index: CPIndex<'a, ClassInfo<'a>> = (pt!(CPIndex)),
-		name_and_type_index: CPIndex<'a, NameAndTypeInfo<'a>> = (pt!(CPIndex))
-	} => MethodRef
-}
-
-cp_entry! {
-	struct InterfaceMethodRefInfo<'a> {
-		class_index: CPIndex<'a, ClassInfo<'a>> = (pt!(CPIndex)),
-		name_and_type_index: CPIndex<'a, NameAndTypeInfo<'a>> = (pt!(CPIndex))
-	} => InterfaceMethodRef
-}
-
-cp_entry! {
-	struct StringInfo<'a> {
-		string_index: CPIndex<'a, UTF8Info<'a>> = (pt!(CPIndex))
-	} => String
-}
-
-cp_entry! {
-	struct IntegerInfo {
-		bytes: u32 = (be_u32),
-	} => Integer
-}
-
-cp_entry! {
-	struct FloatInfo {
-		bytes: u32 = (be_u32),
-	} => Float
-}
-
-cp_entry! {
-	struct LongInfo {
-		high_bytes: u32 = (be_u32),
-		low_bytes: u32 = (be_u32),
-	} => Long
-}
-
-cp_entry! {
-	struct DoubleInfo {
-		high_bytes: u32 = (be_u32),
-		low_bytes: u32 = (be_u32),
-	} => Double
-}
-
-cp_entry! {
-	struct NameAndTypeInfo<'a> {
-		name_index: CPIndex<'a, UTF8Info<'a>> = (pt!(CPIndex)),
-		descriptor_index: CPIndex<'a, UTF8Info<'a>> = (pt!(CPIndex))
-	} => NameAndType
-}
-
-cp_entry! {
-	struct UTF8Info<'a> {
-		data: &'a mstr = (do_parse!(
-			bytes: length_data!(be_u16) >>
-			(mstr::from_mutf8_unchecked(bytes))
-		)),
-	} => UTF8
-}
-
-cp_entry! {
-	enum MethodHandleInfo<'a> = (reference_kind: be_u8) {
-		FieldRef (1 | 2 | 3 | 4) {
-			reference_kind: u8 = (value!(reference_kind)),
-			reference_index: CPIndex<'a, FieldRefInfo<'a>> = (pt!(CPIndex)),
-		},
-		MethodRef (5 | 8 | 6 | 7) {
-			reference_kind: u8 = (value!(reference_kind)),
-			reference_index: CPIndex<'a, MethodRefInfo<'a>> = (pt!(CPIndex)),
-		},
-		InterfaceMethodRef (9) {
-			reference_kind: u8 = (value!(reference_kind)),
-			reference_index: CPIndex<'a, InterfaceMethodRefInfo<'a>> = (pt!(CPIndex)),
-		},
-	} => MethodHandle
-}
-
-cp_entry! {
-	struct MethodTypeInfo<'a> {
-		descriptor_index: CPIndex<'a, UTF8Info<'a>> = (pt!(CPIndex))
-	} => MethodType
-}
-
-cp_entry! {
-	struct DynamicInfo<'a> {
-		bootstrap_method_attr_index: u16 = (be_u16),
-		name_and_type_index: CPIndex<'a, NameAndTypeInfo<'a>> = (pt!(CPIndex))
-	} => Dynamic
-}
-
-cp_entry! {
-	struct InvokeDynamicInfo<'a> {
-		bootstrap_method_attr_index: u16 = (be_u16),
-		name_and_type_index: CPIndex<'a, NameAndTypeInfo<'a>> = (pt!(CPIndex))
-	} => InvokeDynamic
-}
-
-cp_entry! {
-	struct ModuleInfo<'a> {
-		name_index: CPIndex<'a, UTF8Info<'a>> = (pt!(CPIndex))
-	} => Module
-}
-
-cp_entry! {
-	struct PackageInfo<'a> {
-		name_index: CPIndex<'a, UTF8Info<'a>> = (pt!(CPIndex))
-	} => Package
+def_enum_of_structs! {
+	#[binform(endian = "be", tag = "u8")]
+	enum CPEntry('a) {
+		#[binform(tag = "CONSTANT_CLASS_TAG")]
+		@[binform(endian = "be")]
+		Class(ClassInfo('a) {
+			pub name_index: CPIndex<'a, UTF8Info<'a>>,
+		}),
+		#[binform(tag = "CONSTANT_FIELDREF_TAG")]
+		@[binform(endian = "be")]
+		FieldRef(FieldRefInfo('a) {
+			pub class_index: CPIndex<'a, ClassInfo<'a>>,
+			pub name_and_type_index: CPIndex<'a, NameAndTypeInfo<'a>>,
+		}),
+		#[binform(tag = "CONSTANT_METHODREF_TAG")]
+		@[binform(endian = "be")]
+		MethodRef(MethodRefInfo('a) {
+			pub class_index: CPIndex<'a, ClassInfo<'a>>,
+			pub name_and_type_index: CPIndex<'a, NameAndTypeInfo<'a>>,
+		}),
+		#[binform(tag = "CONSTANT_INTERFACE_METHODREF_TAG")]
+		@[binform(endian = "be")]
+		InterfaceMethodRef(InterfaceMethodRefInfo('a) {
+			pub class_index: CPIndex<'a, ClassInfo<'a>>,
+			pub name_and_type_index: CPIndex<'a, NameAndTypeInfo<'a>>
+		}),
+		#[binform(tag = "CONSTANT_STRING_TAG")]
+		@[binform(endian = "be")]
+		String(StringInfo('a) {
+			pub string_index: CPIndex<'a, UTF8Info<'a>>
+		}),
+		#[binform(tag = "CONSTANT_INTEGER_TAG")]
+		@[binform(endian = "be")]
+		Integer(IntegerInfo {
+			pub value: u32
+		}),
+		#[binform(tag = "CONSTANT_FLOAT_TAG")]
+		@[binform(endian = "be")]
+		Float(FloatInfo {
+			pub value: u32
+		}),
+		#[binform(tag = "CONSTANT_LONG_TAG")]
+		@[binform(endian = "be")]
+		Long(LongInfo {
+			pub high_bytes: u32,
+			pub low_bytes: u32,
+		}),
+		#[binform(tag = "CONSTANT_DOUBLE_TAG")]
+		@[binform(endian = "be")]
+		Double(DoubleInfo {
+			pub high_bytes: u32,
+			pub low_bytes: u32,
+		}),
+		#[binform(tag = "CONSTANT_NAME_AND_TYPE_TAG")]
+		@[binform(endian = "be")]
+		NameAndType(NameAndTypeInfo('a) {
+			pub name_index: CPIndex<'a, UTF8Info<'a>>,
+			pub descriptor_index: CPIndex<'a, UTF8Info<'a>>
+		}),
+		#[binform(tag = "CONSTANT_UTF8_TAG")]
+		@[binform(endian = "be")]
+		UTF8(#use UTF8Info('a)),
+		#[binform(tag = "CONSTANT_METHOD_HANDLE_TAG")]
+		@[binform(endian = "be")]
+		MethodHandle(#use MethodHandleInfo('a)),
+		#[binform(tag = "CONSTANT_METHOD_TYPE_TAG")]
+		@[binform(endian = "be")]
+		MethodType(MethodTypeInfo('a) {
+			pub descriptor_index: CPIndex<'a, UTF8Info<'a>>
+		}),
+		#[binform(tag = "CONSTANT_DYNAMIC_TAG")]
+		@[binform(endian = "be")]
+		Dynamic(DynamicInfo('a) {
+			pub bootstrap_method_attr_index: u16,
+			pub name_and_type_index: CPIndex<'a, NameAndTypeInfo<'a>>
+		}),
+		#[binform(tag = "CONSTANT_INVOKE_DYNAMIC_TAG")]
+		@[binform(endian = "be")]
+		InvokeDynamic(InvokeDynamicInfo('a) {
+			pub bootstrap_method_attr_index: u16,
+			pub name_and_type_index: CPIndex<'a, NameAndTypeInfo<'a>>
+		}),
+		#[binform(tag = "CONSTANT_MODULE_TAG")]
+		@[binform(endian = "be")]
+		Module(ModuleInfo('a) {
+			pub name_index: CPIndex<'a, UTF8Info<'a>>
+		}),
+		#[binform(tag = "CONSTANT_PACKAGE_TAG")]
+		@[binform(endian = "be")]
+		Package(PackageInfo('a) {
+			pub name_index: CPIndex<'a, UTF8Info<'a>>
+		})
+	}
 }
 
 impl CPEntry<'_> {
@@ -311,117 +234,103 @@ impl CPEntry<'_> {
 			CPEntry::Package(_) => CONSTANT_PACKAGE_TAG,
 		}
 	}
-
-	named!(pub parse<CPEntry>, switch!(be_u8,
-		CONSTANT_CLASS_TAG => do_parse!(
-			info: pt!(ClassInfo) >>
-			(CPEntry::Class(info))
-		)
-		|
-		CONSTANT_FIELDREF_TAG => do_parse!(
-			info: pt!(FieldRefInfo) >>
-			(CPEntry::FieldRef(info))
-		)
-		|
-		CONSTANT_METHODREF_TAG => do_parse!(
-			info: pt!(MethodRefInfo) >>
-			(CPEntry::MethodRef(info))
-		)
-		|
-		CONSTANT_INTERFACE_METHODREF_TAG => do_parse!(
-			info: pt!(InterfaceMethodRefInfo) >>
-			(CPEntry::InterfaceMethodRef(info))
-		)
-		|
-		CONSTANT_STRING_TAG => do_parse!(
-			info: pt!(StringInfo) >>
-			(CPEntry::String(info))
-		)
-		|
-		CONSTANT_INTEGER_TAG => do_parse!(
-			info: pt!(IntegerInfo) >>
-			(CPEntry::Integer(info))
-		)
-		|
-		CONSTANT_FLOAT_TAG => do_parse!(
-			info: pt!(FloatInfo) >>
-			(CPEntry::Float(info))
-		)
-		|
-		CONSTANT_LONG_TAG => do_parse!(
-			info: pt!(LongInfo) >>
-			(CPEntry::Long(info))
-		)
-		|
-		CONSTANT_DOUBLE_TAG => do_parse!(
-			info: pt!(DoubleInfo) >>
-			(CPEntry::Double(info))
-		)
-		|
-		CONSTANT_NAME_AND_TYPE_TAG => do_parse!(
-			info: pt!(NameAndTypeInfo) >>
-			(CPEntry::NameAndType(info))
-		)
-		|
-		CONSTANT_UTF8_TAG => do_parse!(
-			info: pt!(UTF8Info) >>
-			(CPEntry::UTF8(info))
-		)
-		|
-		CONSTANT_METHOD_HANDLE_TAG => do_parse!(
-			info: pt!(MethodHandleInfo) >>
-			(CPEntry::MethodHandle(info))
-		)
-		|
-		CONSTANT_METHOD_TYPE_TAG => do_parse!(
-			info: pt!(MethodTypeInfo) >>
-			(CPEntry::MethodType(info))
-		)
-		|
-		CONSTANT_DYNAMIC_TAG => do_parse!(
-			info: pt!(DynamicInfo) >>
-			(CPEntry::Dynamic(info))
-		)
-		|
-		CONSTANT_INVOKE_DYNAMIC_TAG => do_parse!(
-			info: pt!(InvokeDynamicInfo) >>
-			(CPEntry::InvokeDynamic(info))
-		)
-		|
-		CONSTANT_MODULE_TAG => do_parse!(
-			info: pt!(ModuleInfo) >>
-			(CPEntry::Module(info))
-		)
-		|
-		CONSTANT_PACKAGE_TAG => do_parse!(
-			info: pt!(PackageInfo) >>
-			(CPEntry::Package(info))
-		)
-	));
 }
 
-parser! {
-	struct FieldInfo<'a> {
-		access_flags     : u16                       = (be_u16),
-		name_index       : CPIndex<'a, UTF8Info<'a>> = (pt!(CPIndex)),
-		descriptor_index : CPIndex<'a, UTF8Info<'a>> = (pt!(CPIndex)),
-		attributes       : Attributes<'a>            = (pt!(Attributes))
+/// So, technically, I don't need the lifetime here, as we copy the string data,
+/// but there's two reasons why I haven't removed it.
+/// Firstly, this is an artefact from when this library initially used nom to parse all of the data,
+/// which had the ability to perform a no-copy read.
+///
+/// Secondly, because I had already wrote all of the code that supports this stuff with lifetime of the input in mind,
+/// it's a good idea to keep it around in the case/event/with the idea that I'll come back to it and finally add
+/// no-copy support.
+#[derive(Debug, Eq, PartialEq, Hash, Clone)]
+pub struct UTF8Info<'a> {
+	_marker: PhantomData<&'a ()>,
+	pub data: MString
+}
+def_fetch!(UTF8Info('a) => UTF8);
+
+impl<'a> ToBytes<BigEndian> for UTF8Info<'a> {
+	fn to_bytes<O: Write>(&self, output: &mut O) -> WriteResult {
+		let data = self.data.as_bytes();
+		let len = data.len();
+		let len = match len.try_into() {
+			Result::Err(_e) => return Err(WriteError::TooLarge(len)),
+			Result::Ok(len) => len,
+		};
+		output.write_u16::<BigEndian>(len)?;
+		output.write_all(data)?;
+		Ok(())
 	}
 }
 
-parser! {
-	struct MethodInfo<'a> {
-		access_flags     : u16                       = (be_u16),
-		name_index       : CPIndex<'a, UTF8Info<'a>> = (pt!(CPIndex)),
-		descriptor_index : CPIndex<'a, UTF8Info<'a>> = (pt!(CPIndex)),
-		attributes       : Attributes<'a>            = (pt!(Attributes))
+impl<'a> FromBytes<BigEndian> for UTF8Info<'a> {
+	type Output = Self;
+
+	fn from_bytes<I: Read>(input: &mut I) -> ReadResult<Self::Output> {
+		let len = input.read_u16::<BigEndian>()?;
+		let mut data = Vec::with_capacity(len as usize);
+		input.take(len as u64).read_to_end(&mut data)?;
+		let data = unsafe { MString::from_mutf8_unchecked(data) };
+		Ok(UTF8Info {
+			_marker: PhantomData,
+			data
+		})
 	}
 }
 
-parser! {
-	struct Attributes<'a> {
-		attributes : Vec<AttributeInfo<'a>> = (length_count!(be_u16, pt!(AttributeInfo)))
-	}
+#[derive(Debug, Eq, PartialEq, Hash, Clone, ToBytes, FromBytes)]
+#[binform(endian = "be", tag = "u8")]
+pub enum MethodHandleInfo<'a> {
+//	#[binform(tag)]
+//	FieldRef {
+//	}
+	#[binform(tag = "55")]
+	Value(PhantomData<&'a ()>)
+}
+def_fetch!(MethodHandleInfo('a) => MethodHandle);
+
+//cp_entry! {
+//	enum MethodHandleInfo<'a> = (reference_kind: be_u8) {
+//		FieldRef (1 | 2 | 3 | 4) {
+//			reference_kind: u8 = (value!(reference_kind)),
+//			reference_index: CPIndex<'a, FieldRefInfo<'a>> = (pt!(CPIndex)),
+//		},
+//		MethodRef (5 | 8 | 6 | 7) {
+//			reference_kind: u8 = (value!(reference_kind)),
+//			reference_index: CPIndex<'a, MethodRefInfo<'a>> = (pt!(CPIndex)),
+//		},
+//		InterfaceMethodRef (9) {
+//			reference_kind: u8 = (value!(reference_kind)),
+//			reference_index: CPIndex<'a, InterfaceMethodRefInfo<'a>> = (pt!(CPIndex)),
+//		},
+//	} => MethodHandle
+//}
+
+#[derive(Debug, Eq, PartialEq, Hash, Clone, ToBytes, FromBytes)]
+#[binform(endian = "be")]
+pub struct FieldInfo<'a> {
+	access_flags: u16,
+	name_index: CPIndex<'a, UTF8Info<'a>>,
+	descriptor_index: CPIndex<'a, UTF8Info<'a>>,
+	attributes: Attributes<'a>,
+}
+
+#[derive(Debug, Eq, PartialEq, Hash, Clone, ToBytes, FromBytes)]
+#[binform(endian = "be")]
+pub struct MethodInfo<'a> {
+	access_flags: u16,
+	name_index: CPIndex<'a, UTF8Info<'a>>,
+	descriptor_index: CPIndex<'a, UTF8Info<'a>>,
+	attributes: Attributes<'a>,
+}
+
+#[derive(Debug, Eq, PartialEq, Hash, Clone, ToBytes, FromBytes)]
+#[binform(endian = "be")]
+pub struct Attributes<'a> {
+	#[binform(len = "u16")]
+	attributes: Vec<AttributeInfo<'a>>
 }
 
 impl<'a> Attributes<'a> {
@@ -453,11 +362,30 @@ impl<'a> IntoIterator for Attributes<'a> {
 	}
 }
 
-parser! {
-	struct AttributeInfo<'a> {
-		attribute_name_index: CPIndex<'a, UTF8Info<'a>> = (pt!(CPIndex)),
-		info: &'a [u8] = (length_data!(be_u32))
+#[derive(Debug, Eq, PartialEq, Hash, Clone, ToBytes, FromBytes)]
+#[binform(endian = "be")]
+pub struct AttributeInfo<'a> {
+	attribute_name_index: CPIndex<'a, UTF8Info<'a>>,
+	#[binform(read = "read_attr_info", write = "write_attr_info")]
+	info: Vec<u8>,
+}
+
+fn read_attr_info<I: Read, BO: ByteOrder, L>(input: &mut I) -> ReadResult<Vec<u8>> {
+	let len = input.read_u32::<BO>()?;
+	let mut result = Vec::with_capacity(len as usize);
+	input.take(len as u64)
+		.read_to_end(&mut result)?;
+	Ok(result)
+}
+
+fn write_attr_info<O: Write, BO: ByteOrder, L>(value: &Vec<u8>, output: &mut O) -> WriteResult {
+	let len = value.len();
+	if len > u32::max_value() as usize {
+		return Err(WriteError::TooLarge(len));
 	}
+	output.write_u32::<BO>(len as u32)?;
+	output.write_all(value)?;
+	Ok(())
 }
 
 pub trait CPType<'a> {
@@ -465,8 +393,6 @@ pub trait CPType<'a> {
 
 	fn fetch(entry: &'a CPEntry<'a>) -> Option<Self::Output>;
 }
-
-use std::marker::PhantomData;
 
 #[derive(Debug, Eq, PartialEq, Hash)]
 pub struct CPIndex<'a, T: 'a + CPType<'a>> {
@@ -480,29 +406,49 @@ impl<'a, T: 'a + CPType<'a>> Clone for CPIndex<'a, T> {
 	}
 }
 
-impl<'a, T: 'a + CPType<'a>> Copy for CPIndex<'a, T> {
+impl<'a, T: 'a + CPType<'a>> Copy for CPIndex<'a, T> {}
+
+impl<'a, T: 'a + CPType<'a>, BO: ByteOrder, L> ToBytes<BO, L> for CPIndex<'a, T> {
+	fn to_bytes<O: Write>(&self, output: &mut O) -> WriteResult {
+		output.write_u16::<BO>(self.index)?;
+		Ok(())
+	}
+}
+
+impl<'a, T: 'a + CPType<'a>, BO: ByteOrder, L> FromBytes<BO, L> for CPIndex<'a, T> {
+	type Output = Self;
+
+	fn from_bytes<I: Read>(input: &mut I) -> ReadResult<Self::Output> {
+		let value = input.read_u16::<BO>()?;
+		let index = CPIndex {
+			index: value,
+			_marker: PhantomData,
+		};
+		Ok(index)
+	}
 }
 
 impl<'a, T: 'a + CPType<'a>> CPIndex<'a, T> {
-	named!(pub parse<CPIndex<'a, T>>, do_parse!(
-		index: be_u16 >>
-		(CPIndex {
-			index,
+	pub fn read_non_zero<I: Read, BO: ByteOrder, L>(input: &mut I) -> ReadResult<Option<Self>> {
+		let value = input.read_u16::<BO>()?;
+		if value == 0 {
+			return Ok(None);
+		}
+		Ok(Some(CPIndex {
+			index: value,
 			_marker: PhantomData,
-		})
-	));
+		}))
+	}
 
-	named!(pub parse_non_zero<Option<CPIndex<'a, T>>>, do_parse!(
-		index: be_u16 >>
-		(
-			if index == 0 {
-				None
-			} else {
-				Some(CPIndex {
-					index,
-					_marker: PhantomData,
-				})
+	pub fn write_non_zero<O: Write, BO: ByteOrder, L>(value: &Option<Self>, output: &mut O) -> WriteResult {
+		match value {
+			None => {
+				output.write_u16::<BO>(0)?;
 			}
-		)
-	));
+			Some(value) => {
+				output.write_u16::<BO>(value.index)?;
+			}
+		}
+		Ok(())
+	}
 }

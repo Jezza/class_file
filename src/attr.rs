@@ -1,75 +1,71 @@
-use nom::*;
-
 use crate::*;
+use std::io::Cursor;
 
 pub trait Attribute<'a>: Sized {
 	fn from_attributes(attributes: &Attributes<'a>, cp: &ConstantPool<'a>) -> Option<Self>;
 }
 
-macro_rules! attr {
-	(struct $type:ident <$first:lifetime $(,$rest:lifetime)*> {
-		$($field_name:ident: $field_type:ty = ($($field_parser:tt)*)),* $(,)?
-	}) => {
-		parser! {
-			struct $type<$first $(,$rest)*> {
-				$($field_name: $field_type = ($($field_parser)*)),*
-			}
-		}
-
-		impl<$first $(,$rest)*> Attribute<$first> for $type<$first $(,$rest)*> {
-			fn from_attributes(attributes: &Attributes<$first>, cp: &ConstantPool<$first>) -> Option<Self> {
+macro_rules! impl_attr {
+	($type:ident $( ( $($generics:tt),* ) )?) => {
+		impl<'a $(, $($generics),* )?> Attribute<'a> for $type $( < $( $generics ),* > )? {
+			fn from_attributes(attributes: &Attributes, cp: &ConstantPool) -> Option<Self> {
 				let info = attributes.named(cp, stringify!($type))?;
-				let result = $type::parse(info.info);
-				if let Ok(value) = result {
-					Some(value.1)
-				} else {
-					None
-				}
-			}
-		}
-	};
-	(struct $type:ident {
-		$($field_name:ident: $field_type:ty = ($($field_parser:tt)*)),* $(,)?
-	}) => {
-		parser! {
-			struct $type {
-				$($field_name: $field_type = ($($field_parser)*)),*
-			}
-		}
-
-		impl<'a> Attribute<'a> for $type {
-			fn from_attributes(attributes: &Attributes<'a>, cp: &ConstantPool<'a>) -> Option<Self> {
-				let info = attributes.named(cp, stringify!($type))?;
+				let data = &info.info;
 		
-				let result = $type::parse(info.info);
-				if let Ok(value) = result {
-					Some(value.1)
-				} else {
-					None
+				let mut input = Cursor::new(data);
+				if let Ok(value) = <$type as FromBytes<BigEndian>>::from_bytes(&mut input) {
+					return Some(value);
 				}
+				return None;
 			}
 		}
+	}
+}
+
+macro_rules! attr {
+	(
+		struct $type:ident $( ( $($generics:tt),* ) )? {
+			$($body:tt)*
+		}
+	) => {
+		def! {
+			struct $type $( ( $($generics),* ) )? {
+				$($body)*
+			}
+		}
+		impl_attr!($type $( ( $($generics),* ) )?);
 	};
 }
 
 macro_rules! table {
-	(struct $table:ident $(<$first:lifetime $(,$rest:lifetime)*>)? ($($table_parser:tt)*) => struct $type:ident {
-		$($field_name:ident: $field_type:ty = ($($field_parser:tt)*)),*
-	}) => {
-		parser! {
-			struct $type $(<$first $(,$rest)*>)? {
-				$($field_name: $field_type = ($($field_parser)*)),*
+	(
+		@len = $len:literal;
+		struct $table:ident $( ( $($generics:tt)* ) )? => $inner:ident;
+	) => {
+		def! {
+			struct $table $( ( $($generics)* ) )? {
+				#[binform(len = $len)]
+				table: Vec<$inner $( < $($generics)* > )?>,
 			}
 		}
-		table!(struct $table $(<$first $(,$rest)*>)? ($($table_parser)*) => $type;);
 	};
-	(struct $table:ident $(<$first:lifetime $(,$rest:lifetime)*>)? ($($table_parser:tt)*) => $type:ident;) => {
+	(
+		@len = $len:literal;
+		struct $table:ident $( ( $($generics:tt)* ) )? => struct $inner:ident {
+			$($body:tt)*
+		}
+	) => {
+		table! {
+			@len = $len;
+			struct $table $( ( $($generics)* ) )? => $inner;
+		}
+
 		attr! {
-			struct $table $(<$first $(,$rest)*>)? {
-				data: Vec<$type $(<$first $(,$rest)*> )? > = (length_count!($($table_parser)*, pt!($type)))
+			struct $inner $( ( $($generics)* ) )? {
+				$($body)*
 			}
 		}
-	};
+	}
 }
 
 macro_rules! singleton {
@@ -87,8 +83,8 @@ macro_rules! singleton {
 }
 
 attr! {
-	struct ConstantValue<'a> {
-		constantvalue_index: CPIndex<'a, ConstantValueInfo<'a>> = (pt!(CPIndex))
+	struct ConstantValue('a) {
+		constantvalue_index: CPIndex<'a, ConstantValueInfo<'a>>
 	}
 }
 
@@ -154,31 +150,62 @@ impl<'a> CPType<'a> for ConstantValueInfo<'a> {
 }
 
 attr! {
-	struct Code<'a> {
-		max_stack: u16 = (be_u16),
-		max_locals: u16 = (be_u16),
-		code: &'a [u8] = (length_data!(be_u32)),
-		exception_table: Vec<Exception<'a>> = (length_count!(be_u16, pt!(Exception))),
-		attributes: Attributes<'a> = (pt!(Attributes))
+	struct Code('a) {
+		max_stack: u16,
+		max_locals: u16,
+//		code: &'a [u8] = (length_data!(be_u32)),
+		// u32
+		#[binform(read = "read_code", write = "write_code")]
+		code: Vec<u8>,
+		#[binform(len = "u16")]
+		exception_table: Vec<Exception<'a>>,
+		attributes: Attributes<'a>,
 	}
 }
 
-parser! {
-	struct Exception<'a> {
-		start_pc: u16 = (be_u16),
-		end_pc: u16 = (be_u16),
-		handler_pc: u16 = (be_u16),
-		catch_type: CPIndex<'a, ClassInfo<'a>> = (pt!(CPIndex))
+fn read_code<I: Read, BO: ByteOrder, L>(input: &mut I) -> ReadResult<Vec<u8>> {
+	let len = input.read_u32::<BO>()?;
+	let mut result = Vec::with_capacity(len as usize);
+
+	for _ in 0..len {
+		result.push(<u8 as FromBytes<BO, L>>::from_bytes(input)?);
+	}
+	Ok(result)
+}
+
+fn write_code<O: Write, BO: ByteOrder, L>(value: &Vec<u8>, output: &mut O) -> WriteResult {
+	let len = value.len();
+	if len > u32::max_value() as usize {
+		return Err(WriteError::TooLarge(len));
+	}
+	output.write_u32::<BO>(len as u32)?;
+	output.write_all(value)?;
+	Ok(())
+}
+
+def! {
+	struct Exception('a) {
+		start_pc: u16,
+		end_pc: u16,
+		handler_pc: u16,
+		catch_type: CPIndex<'a, ClassInfo<'a>>,
 	}
 }
 
 table! {
-	struct StackMapTable<'a>(be_u16) => StackMapFrame;
+	@len = "u16";
+	struct StackMapTable('a) => StackMapFrame;
 }
 
+/// The bytecode offset at which a stack map frame applies is calculated by taking the
+/// value `offset_delta` specified in the frame (either explicitly or implicitly), and
+/// adding `offset_delta + 1` to the bytecode offset of the previous frame, unless
+/// the previous frame is the initial frame of the method. In that case, the bytecode
+/// offset at which the stack map frame applies is the value offset_delta specified
+/// in the frame.
 #[derive(Debug, Eq, PartialEq, Hash, Clone)]
 pub enum StackMapFrame<'a> {
-	SameFrame,
+	SameFrame(u8),
 	SameLocals(VerificationTypeInfo<'a>),
 	SameLocalsExtended {
 		offset: u16,
@@ -197,87 +224,96 @@ pub enum StackMapFrame<'a> {
 	}
 }
 
-// @TODO Jezza - 31 Dec. 2018: Swap out these "magic" numbers with constants... 
-impl<'a> StackMapFrame<'a> {
-	named!(pub parse<StackMapFrame>, switch!(be_u8,
-		0..=63 => value!(StackMapFrame::SameFrame)
-		|
-		64..=127 => do_parse!(
-			verification_type_info: pt!(VerificationTypeInfo) >>
-			(StackMapFrame::SameLocals(verification_type_info))
-		)
-		|
-		247 => do_parse!(
-			offset: be_u16 >>
-			verification_type_info: pt!(VerificationTypeInfo) >>
-			(StackMapFrame::SameLocalsExtended {
-				offset,
-				verification_type_info
-			})
-		)
-		|
-		148..=250 => do_parse!(
-			offset_delta: be_u16 >>
-			(StackMapFrame::ChopFrame(offset_delta))
-		)
-		|
-		251 => do_parse!(
-			offset: be_u16 >>
-			(StackMapFrame::SameFrameExtended(offset))
-		)
-		|
-		252 => do_parse!(
-			offset_delta: be_u16 >>
-			locals: length_count!(value!(1), pt!(VerificationTypeInfo)) >>
-			(StackMapFrame::AppendFrame {
-				offset_delta,
-				locals,
-			})
-		)
-		|
-		253 => do_parse!(
-			offset_delta: be_u16 >>
-			locals: length_count!(value!(2), pt!(VerificationTypeInfo)) >>
-			(StackMapFrame::AppendFrame {
-				offset_delta,
-				locals,
-			})
-		)
-		|
-		254 => do_parse!(
-			offset_delta: be_u16 >>
-			locals: length_count!(value!(3), pt!(VerificationTypeInfo)) >>
-			(StackMapFrame::AppendFrame {
-				offset_delta,
-				locals,
-			})
-		)
-		|
-		255 => do_parse!(
-			offset_delta: be_u16 >>
-			locals: length_count!(be_u16, pt!(VerificationTypeInfo)) >>
-			stack: length_count!(be_u16, pt!(VerificationTypeInfo)) >>
-			(StackMapFrame::FullFrame {
-				offset_delta,
-				locals,
-				stack,
-			})
-		)
-	));
+impl<'a> FromBytes<BigEndian, ()> for StackMapFrame<'a> {
+	type Output = Self;
+
+	fn from_bytes<I: Read>(input: &mut I) -> ReadResult<Self::Output> {
+//		let tag = input.read_u8::<BigEndian>()?;
+
+//		match tag {
+//			0..=63 => {
+//				
+//			}
+//		}
+
+		unimplemented!()
+	}
 }
 
-#[derive(Debug, Eq, PartialEq, Hash, Clone)]
-pub enum VerificationTypeInfo<'a> {
-	Top,
-	Integer,
-	Float,
-	Double,
-	Long,
-	Null,
-	UninitializedThis,
-	ObjectVariable(CPIndex<'a, ClassInfo<'a>>),
-	Uninitialized(u16),
+impl<'a> ToBytes<BigEndian, ()> for StackMapFrame<'a> {
+	fn to_bytes<O: Write>(&self, output: &mut O) -> WriteResult {
+		unimplemented!()
+	}
 }
+
+//// @TODO Jezza - 31 Dec. 2018: Swap out these "magic" numbers with constants... 
+//impl<'a> StackMapFrame<'a> {
+//	named!(pub parse<StackMapFrame>, switch!(be_u8,
+//		0..=63 => value!(StackMapFrame::SameFrame)
+//		|
+//		64..=127 => do_parse!(
+//			verification_type_info: pt!(VerificationTypeInfo) >>
+//			(StackMapFrame::SameLocals(verification_type_info))
+//		)
+//		|
+//		247 => do_parse!(
+//			offset: be_u16 >>
+//			verification_type_info: pt!(VerificationTypeInfo) >>
+//			(StackMapFrame::SameLocalsExtended {
+//				offset,
+//				verification_type_info
+//			})
+//		)
+//		|
+//		148..=250 => do_parse!(
+//			offset_delta: be_u16 >>
+//			(StackMapFrame::ChopFrame(offset_delta))
+//		)
+//		|
+//		251 => do_parse!(
+//			offset: be_u16 >>
+//			(StackMapFrame::SameFrameExtended(offset))
+//		)
+//		|
+//		252 => do_parse!(
+//			offset_delta: be_u16 >>
+//			locals: length_count!(value!(1), pt!(VerificationTypeInfo)) >>
+//			(StackMapFrame::AppendFrame {
+//				offset_delta,
+//				locals,
+//			})
+//		)
+//		|
+//		253 => do_parse!(
+//			offset_delta: be_u16 >>
+//			locals: length_count!(value!(2), pt!(VerificationTypeInfo)) >>
+//			(StackMapFrame::AppendFrame {
+//				offset_delta,
+//				locals,
+//			})
+//		)
+//		|
+//		254 => do_parse!(
+//			offset_delta: be_u16 >>
+//			locals: length_count!(value!(3), pt!(VerificationTypeInfo)) >>
+//			(StackMapFrame::AppendFrame {
+//				offset_delta,
+//				locals,
+//			})
+//		)
+//		|
+//		255 => do_parse!(
+//			offset_delta: be_u16 >>
+//			locals: length_count!(be_u16, pt!(VerificationTypeInfo)) >>
+//			stack: length_count!(be_u16, pt!(VerificationTypeInfo)) >>
+//			(StackMapFrame::FullFrame {
+//				offset_delta,
+//				locals,
+//				stack,
+//			})
+//		)
+//	));
+//}
 
 const ITEM_TOP: u8 = 0;
 const ITEM_INTEGER: u8 = 1;
@@ -289,79 +325,79 @@ const ITEM_UNINITIALIZED_THIS: u8 = 6;
 const ITEM_OBJECT: u8 = 7;
 const ITEM_UNINITIALIZED: u8 = 8;
 
-impl<'a> VerificationTypeInfo<'a> {
-	named!(pub parse<VerificationTypeInfo>, switch!(be_u8,
-		ITEM_TOP => value!(VerificationTypeInfo::Top)
-		|
-		ITEM_INTEGER => value!(VerificationTypeInfo::Integer)
-		|
-		ITEM_FLOAT => value!(VerificationTypeInfo::Float)
-		|
-		ITEM_DOUBLE => value!(VerificationTypeInfo::Double)
-		|
-		ITEM_LONG => value!(VerificationTypeInfo::Long)
-		|
-		ITEM_NULL => value!(VerificationTypeInfo::Null)
-		|
-		ITEM_UNINITIALIZED_THIS => value!(VerificationTypeInfo::UninitializedThis)
-		|
-		ITEM_OBJECT => do_parse!(
-			class_index: pt!(CPIndex) >>
-			(VerificationTypeInfo::ObjectVariable(class_index))
-		)
-		|
-		ITEM_UNINITIALIZED => do_parse!(
-			offset: be_u16 >>
-			(VerificationTypeInfo::Uninitialized(offset))
-		)
-	));
+#[derive(Debug, Eq, PartialEq, Hash, Clone, ToBytes, FromBytes)]
+#[binform(endian = "be", tag = "u8")]
+pub enum VerificationTypeInfo<'a> {
+	#[binform(tag = "ITEM_TOP")]
+	Top,
+	#[binform(tag = "ITEM_INTEGER")]
+	Integer,
+	#[binform(tag = "ITEM_FLOAT")]
+	Float,
+	#[binform(tag = "ITEM_DOUBLE")]
+	Double,
+	#[binform(tag = "ITEM_LONG")]
+	Long,
+	#[binform(tag = "ITEM_NULL")]
+	Null,
+	#[binform(tag = "ITEM_UNINITIALIZED_THIS")]
+	UninitializedThis,
+	#[binform(tag = "ITEM_OBJECT")]
+	ObjectVariable(CPIndex<'a, ClassInfo<'a>>),
+	#[binform(tag = "ITEM_UNINITIALIZED")]
+	Uninitialized(u16),
 }
 
 attr! {
-	struct Exceptions<'a> {
-		table: Vec<CPIndex<'a, ClassInfo<'a>>> = (length_count!(be_u16, pt!(CPIndex)))
+	struct Exceptions('a) {
+		#[binform(len = "u16")]
+		table: Vec<CPIndex<'a, ClassInfo<'a>>>
 	}
 }
 
 table! {
-	struct InnerClasses<'a>(be_u16) => struct InnerClass {
-		inner_class_info_index: CPIndex<'a, ClassInfo<'a>> = (pt!(CPIndex)),
-		outer_class_info_index: Option<CPIndex<'a, ClassInfo<'a>>> = (call!(CPIndex::parse_non_zero)),
-		inner_name_index: Option<CPIndex<'a, UTF8Info<'a>>> = (call!(CPIndex::parse_non_zero)),
-		inner_class_access_flags: u16 = (be_u16)
+	@len = "u16";
+	struct InnerClasses('a) => struct InnerClass {
+		inner_class_info_index: CPIndex<'a, ClassInfo<'a>>,
+		#[binform(read = "CPIndex::read_non_zero", write = "CPIndex::write_non_zero")]
+		outer_class_info_index: Option<CPIndex<'a, ClassInfo<'a>>>,
+		#[binform(read = "CPIndex::read_non_zero", write = "CPIndex::write_non_zero")]
+		inner_name_index: Option<CPIndex<'a, UTF8Info<'a>>>,
+		inner_class_access_flags: u16
 	}
 }
 
 attr! {
-	struct EnclosingMethod<'a> {
-		class_index: CPIndex<'a, ClassInfo<'a>> = (pt!(CPIndex)),
-		method_index: CPIndex<'a, NameAndTypeInfo<'a>> = (pt!(CPIndex))
+	struct EnclosingMethod('a) {
+		class_index: CPIndex<'a, ClassInfo<'a>>,
+		method_index: CPIndex<'a, NameAndTypeInfo<'a>>,
 	}
 }
 
 singleton!(struct Synthetic);
 
 attr! {
-	struct Signature<'a> {
-		class_index: CPIndex<'a, UTF8Info<'a>> = (pt!(CPIndex))
+	struct Signature('a) {
+		class_index: CPIndex<'a, UTF8Info<'a>>,
 	}
 }
 
 attr! {
-	struct SourceFile<'a> {
-		sourcefile_index: CPIndex<'a, UTF8Info<'a>> = (pt!(CPIndex))
+	struct SourceFile('a) {
+		sourcefile_index: CPIndex<'a, UTF8Info<'a>>,
 	}
 }
 
 #[derive(Debug, Eq, PartialEq, Hash, Clone)]
 pub struct SourceDebugExtension<'a> {
-	pub data: &'a mstr
+	_marker: PhantomData<&'a ()>,
+	pub data: MString
 }
 
 impl<'a> Attribute<'a> for SourceDebugExtension<'a> {
 	fn from_attributes(attributes: &Attributes<'a>, cp: &ConstantPool<'a>) -> Option<Self> {
 		let info = attributes.named(cp, "SourceDebugExtension")?;
-		let data = mstr::from_mutf8_unchecked(info.info);
+		let data = unsafe { MString::from_mutf8_unchecked(info.info) };
 		Some(SourceDebugExtension {
 			data
 		})
@@ -369,262 +405,275 @@ impl<'a> Attribute<'a> for SourceDebugExtension<'a> {
 }
 
 table! {
-	struct LineNumberTable(be_u16) => struct LineNumber {
-		start_pc: u16 = (be_u16),
-		line_number: u16 = (be_u16)
+	@len = "u16";
+	struct LineNumberTable => struct LineNumber {
+		start_pc: u16,
+		line_number: u16,
 	}
 }
 
 table! {
-	struct LocalVariableTable<'a>(be_u16) => struct LocalVariable {
-		start_pc: u16 = (be_u16),
-		length: u16 = (be_u16),
-		name_index: CPIndex<'a, UTF8Info<'a>> = (pt!(CPIndex)),
-		descriptor_index: CPIndex<'a, UTF8Info<'a>> = (pt!(CPIndex)),
-		index: u16 = (be_u16)
+	@len = "u16";
+	struct LocalVariableTable('a) => struct LocalVariable {
+		start_pc: u16,
+		length: u16,
+		name_index: CPIndex<'a, UTF8Info<'a>>,
+		descriptor_index: CPIndex<'a, UTF8Info<'a>>,
+		index: u16,
 	}
 }
 
 table! {
-	struct LocalVariableTypeTable<'a>(be_u16) => struct LocalVariableType {
-		start_pc: u16 = (be_u16),
-		length: u16 = (be_u16),
-		name_index: CPIndex<'a, UTF8Info<'a>> = (pt!(CPIndex)),
-		signature_index: CPIndex<'a, UTF8Info<'a>> = (pt!(CPIndex)),
-		index: u16 = (be_u16)
+	@len = "u16";
+	struct LocalVariableTypeTable('a) => struct LocalVariableType {
+		start_pc: u16,
+		length: u16,
+		name_index: CPIndex<'a, UTF8Info<'a>>,
+		signature_index: CPIndex<'a, UTF8Info<'a>>,
+		index: u16,
 	}
 }
 
 singleton!(struct Deprecated);
 
 table! {
-	struct RuntimeVisibleAnnotations<'a>(be_u16) => Annotation;
+	@len = "u16";
+	struct RuntimeVisibleAnnotations('a) => Annotation;
 }
 
 table! {
-	struct RuntimeInvisibleAnnotations<'a>(be_u16) => Annotation;
+	@len = "u16";
+	struct RuntimeInvisibleAnnotations('a) => Annotation;
 }
 
-parser! {
-	struct Annotation<'a> {
-		type_index: CPIndex<'a, UTF8Info<'a>> = (pt!(CPIndex)),
-		element_value_pairs: Vec<ElementValuePair<'a>> = (length_count!(be_u16, pt!(ElementValuePair)))
+def! {
+	struct Annotation('a) {
+		type_index: CPIndex<'a, UTF8Info<'a>>,
+		#[binform(len = "u16")]
+		element_value_pairs: Vec<ElementValuePair<'a>>,
 	}
 }
 
-parser! {
-	struct ElementValuePair<'a> {
-		element_name_index: CPIndex<'a, UTF8Info<'a>> = (pt!(CPIndex)),
-		element_value: ElementValue<'a> = (pt!(ElementValue))
+def! {
+	struct ElementValuePair('a) {
+		element_name_index: CPIndex<'a, UTF8Info<'a>>,
+//		element_value: ElementValue<'a>,
 	}
 }
 
-parser! {
-	enum ElementValue<'a> = (kind: be_u8) {
-		Byte(b'B') {
-			const_value_index: CPIndex<'a, IntegerInfo> = (pt!(CPIndex))
-		},
-		Char(b'C') {
-			const_value_index: CPIndex<'a, IntegerInfo> = (pt!(CPIndex))
-		},
-		Double(b'D') {
-			const_value_index: CPIndex<'a, DoubleInfo> = (pt!(CPIndex))
-		},
-		Float(b'F') {
-			const_value_index: CPIndex<'a, FloatInfo> = (pt!(CPIndex))
-		},
-		Integer(b'I') {
-			const_value_index: CPIndex<'a, IntegerInfo> = (pt!(CPIndex))
-		},
-		Long(b'J') {
-			const_value_index: CPIndex<'a, LongInfo> = (pt!(CPIndex))
-		},
-		Short(b'S') {
-			const_value_index: CPIndex<'a, IntegerInfo> = (pt!(CPIndex))
-		},
-		Boolean(b'Z') {
-			const_value_index: CPIndex<'a, IntegerInfo> = (pt!(CPIndex))
-		},
-		String(b's') {
-			const_value_index: CPIndex<'a, UTF8Info<'a>> = (pt!(CPIndex))
-		},
-		Enum(b'e') {
-			type_name_index: CPIndex<'a, UTF8Info<'a>> = (pt!(CPIndex)),
-			const_name_index: CPIndex<'a, UTF8Info<'a>> = (pt!(CPIndex))
-		},
-		Class(b'c') {
-			class_info_index: CPIndex<'a, UTF8Info<'a>> = (pt!(CPIndex))
-		},
-		Annotation(b'@') {
-			annotation_value: Annotation<'a> = (pt!(Annotation))
-		},
-		Array(b'[') {
-			array_value: Vec<ElementValue<'a>> = (length_count!(be_u16, pt!(ElementValue)))
-		},
+#[derive(Debug, Eq, PartialEq, Hash, Clone, ToBytes, FromBytes)]
+#[binform(endian = "be", tag = "u8")]
+pub enum ElementValue<'a> {
+	#[binform(tag = "0")]
+	Byte(PhantomData<&'a ()>)
+}
+
+//parser! {
+//	enum ElementValue<'a> = (kind: be_u8) {
+//		Byte(b'B') {
+//			const_value_index: CPIndex<'a, IntegerInfo> = (pt!(CPIndex))
+//		},
+//		Char(b'C') {
+//			const_value_index: CPIndex<'a, IntegerInfo> = (pt!(CPIndex))
+//		},
+//		Double(b'D') {
+//			const_value_index: CPIndex<'a, DoubleInfo> = (pt!(CPIndex))
+//		},
+//		Float(b'F') {
+//			const_value_index: CPIndex<'a, FloatInfo> = (pt!(CPIndex))
+//		},
+//		Integer(b'I') {
+//			const_value_index: CPIndex<'a, IntegerInfo> = (pt!(CPIndex))
+//		},
+//		Long(b'J') {
+//			const_value_index: CPIndex<'a, LongInfo> = (pt!(CPIndex))
+//		},
+//		Short(b'S') {
+//			const_value_index: CPIndex<'a, IntegerInfo> = (pt!(CPIndex))
+//		},
+//		Boolean(b'Z') {
+//			const_value_index: CPIndex<'a, IntegerInfo> = (pt!(CPIndex))
+//		},
+//		String(b's') {
+//			const_value_index: CPIndex<'a, UTF8Info<'a>> = (pt!(CPIndex))
+//		},
+//		Enum(b'e') {
+//			type_name_index: CPIndex<'a, UTF8Info<'a>> = (pt!(CPIndex)),
+//			const_name_index: CPIndex<'a, UTF8Info<'a>> = (pt!(CPIndex))
+//		},
+//		Class(b'c') {
+//			class_info_index: CPIndex<'a, UTF8Info<'a>> = (pt!(CPIndex))
+//		},
+//		Annotation(b'@') {
+//			annotation_value: Annotation<'a> = (pt!(Annotation))
+//		},
+//		Array(b'[') {
+//			array_value: Vec<ElementValue<'a>> = (length_count!(be_u16, pt!(ElementValue)))
+//		},
+//	}
+//}
+
+table! {
+	@len = "u8";
+	struct RuntimeVisibleParameterAnnotations('a) => ParameterAnnotations;
+}
+
+table! {
+	@len = "u8";
+	struct RuntimeInvisibleParameterAnnotations('a) => ParameterAnnotations;
+}
+
+def! {
+	struct ParameterAnnotations('a) {
+		#[binform(len = "u16")]
+		annotations: Vec<Annotation<'a>>
 	}
 }
 
 table! {
-	struct RuntimeVisibleParameterAnnotations<'a>(be_u8) => ParameterAnnotations;
+	@len = "u16";
+	struct RuntimeVisibleTypeAnnotations('a) => TypeAnnotation;
 }
 
 table! {
-	struct RuntimeInvisibleParameterAnnotations<'a>(be_u8) => ParameterAnnotations;
+	@len = "u16";
+	struct RuntimeInvisibleTypeAnnotations('a) => TypeAnnotation;
 }
 
-parser! {
-	struct ParameterAnnotations<'a> {
-		annotations: Vec<Annotation<'a>> = (length_count!(be_u16, pt!(Annotation)))
+def! {
+	struct TypeAnnotation('a) {
+		target_info         : TargetInfo,
+		target_path         : TypePath,
+		type_index          : CPIndex<'a, UTF8Info<'a>>,
+		#[binform(len = "u16")]
+		element_value_pairs : Vec<ElementValuePair<'a>>
 	}
 }
 
-table! {
-	struct RuntimeVisibleTypeAnnotations<'a>(be_u16) => TypeAnnotation;
-}
-
-table! {
-	struct RuntimeInvisibleTypeAnnotations<'a>(be_u16) => TypeAnnotation;
-}
-
-parser! {
-	struct TypeAnnotation<'a> {
-		target_info         : TargetInfo                = (pt!(TargetInfo)),
-		target_path         : TypePath                  = (pt!(TypePath)),
-		type_index          : CPIndex<'a, UTF8Info<'a>> = (pt!(CPIndex)),
-		element_value_pairs : Vec<ElementValuePair<'a>> = (length_count!(be_u16, pt!(ElementValuePair)))
-	}
-}
-
-#[derive(Debug, Eq, PartialEq, Hash, Clone)]
+#[derive(Debug, Eq, PartialEq, Hash, Clone, ToBytes, FromBytes)]
+#[binform(endian = "be", tag = "u8")]
 pub enum TargetInfo {
-	TypeParameter(u8),
-	SuperType(u16),
-	TypeParameterBound {
-		type_parameter_index: u8,
-		bound_index: u8,
-	},
-	Empty,
-	FormalParameter(u8),
-	Throws(u16),
-	LocalVar {
-		start_pc: u16,
-		length: u16,
-		index: u16,
-	},
-	Catch(u16),
-	Offset(u16),
-	TypeArgument {
-		offset: u16,
-		type_argument_index: u8
-	},
+	#[binform(tag = "1")]
+	Unknown
+//	TypeParameter(u8),
+//	SuperType(u16),
+//	TypeParameterBound {
+//		type_parameter_index: u8,
+//		bound_index: u8,
+//	},
+//	Empty,
+//	FormalParameter(u8),
+//	Throws(u16),
+//	LocalVar {
+//		start_pc: u16,
+//		length: u16,
+//		index: u16,
+//	},
+//	Catch(u16),
+//	Offset(u16),
+//	TypeArgument {
+//		offset: u16,
+//		type_argument_index: u8
+//	},
 }
+//
+//impl TargetInfo {
+//	named!(pub parse<TargetInfo>, switch!(be_u8,
+//		0x00 | 0x01 => do_parse!(
+//			index: be_u8 >>
+//			(TargetInfo::TypeParameter(index))
+//		)
+//		|
+//		0x10 => do_parse!(
+//			index: be_u16 >>
+//			(TargetInfo::SuperType(index))
+//		)
+//		|
+//		0x11 | 0x12 => do_parse!(
+//			type_parameter_index: be_u8 >>
+//			bound_index: be_u8 >>
+//			(TargetInfo::TypeParameterBound {
+//				type_parameter_index,
+//				bound_index,
+//			})
+//		)
+//		|
+//		0x13 | 0x14 | 0x15 => value!(TargetInfo::Empty)
+//		|
+//		0x16 => do_parse!(
+//			index: be_u8 >>
+//			(TargetInfo::FormalParameter(index))
+//		)
+//		|
+//		0x17 => do_parse!(
+//			throws_type_index: be_u16 >>
+//			(TargetInfo::Throws(throws_type_index))
+//		)
+//		|
+//		0x40 | 0x41 => do_parse!(
+//			start_pc: be_u16 >>
+//			length: be_u16 >>
+//			index: be_u16 >>
+//			(TargetInfo::LocalVar {
+//				start_pc,
+//				length,
+//				index,
+//			})
+//		)
+//		|
+//		0x42 => do_parse!(
+//			exception_table_index: be_u16 >>
+//			(TargetInfo::Catch(exception_table_index))
+//		)
+//		|
+//		0x43 | 0x44 | 0x45 | 0x46 => do_parse!(
+//			offset: be_u16 >>
+//			(TargetInfo::Offset(offset))
+//		)
+//		|
+//		0x47 | 0x48 | 0x49 | 0x4A | 0x4B => do_parse!(
+//			offset: be_u16 >>
+//			type_argument_index: be_u8 >>
+//			(TargetInfo::TypeArgument {
+//				offset,
+//				type_argument_index,
+//			})
+//		)
+//	));
+//}
 
-impl TargetInfo {
-	named!(pub parse<TargetInfo>, switch!(be_u8,
-		0x00 | 0x01 => do_parse!(
-			index: be_u8 >>
-			(TargetInfo::TypeParameter(index))
-		)
-		|
-		0x10 => do_parse!(
-			index: be_u16 >>
-			(TargetInfo::SuperType(index))
-		)
-		|
-		0x11 | 0x12 => do_parse!(
-			type_parameter_index: be_u8 >>
-			bound_index: be_u8 >>
-			(TargetInfo::TypeParameterBound {
-				type_parameter_index,
-				bound_index,
-			})
-		)
-		|
-		0x13 | 0x14 | 0x15 => value!(TargetInfo::Empty)
-		|
-		0x16 => do_parse!(
-			index: be_u8 >>
-			(TargetInfo::FormalParameter(index))
-		)
-		|
-		0x17 => do_parse!(
-			throws_type_index: be_u16 >>
-			(TargetInfo::Throws(throws_type_index))
-		)
-		|
-		0x40 | 0x41 => do_parse!(
-			start_pc: be_u16 >>
-			length: be_u16 >>
-			index: be_u16 >>
-			(TargetInfo::LocalVar {
-				start_pc,
-				length,
-				index,
-			})
-		)
-		|
-		0x42 => do_parse!(
-			exception_table_index: be_u16 >>
-			(TargetInfo::Catch(exception_table_index))
-		)
-		|
-		0x43 | 0x44 | 0x45 | 0x46 => do_parse!(
-			offset: be_u16 >>
-			(TargetInfo::Offset(offset))
-		)
-		|
-		0x47 | 0x48 | 0x49 | 0x4A | 0x4B => do_parse!(
-			offset: be_u16 >>
-			type_argument_index: be_u8 >>
-			(TargetInfo::TypeArgument {
-				offset,
-				type_argument_index,
-			})
-		)
-	));
-}
-
-parser! {
+def! {
 	struct TypePath {
-		data: Vec<TypePathSegment> = (length_count!(be_u8, pt!(TypePathSegment)))
+		#[binform(len = "u8")]
+		data: Vec<TypePathSegment>
 	}
 }
 
-#[derive(Debug, Eq, PartialEq, Hash, Clone)]
+#[derive(Debug, Eq, PartialEq, Hash, Clone, ToBytes, FromBytes)]
+#[binform(endian = "be", tag = "u8")]
 pub enum TypePathSegment {
+	#[binform(tag = "0", after(expect(ty = "u8", value = "0")))]
 	Array,
+	#[binform(tag = "1", after(expect(ty = "u8", value = "0")))]
 	NestedType,
+	#[binform(tag = "3", after(expect(ty = "u8", value = "0")))]
 	WildcardBound,
+	#[binform(tag = "4")]
 	TypeArgument(u8),
 }
 
-impl TypePathSegment {
-	named!(pub parse<TypePathSegment>, do_parse!(
-		type_path_kind: be_u8 >>
-		type_argument_index: be_u8 >>
-		segment: switch!(value!(type_path_kind),
-			0 => value!(TypePathSegment::Array)
-			|
-			1 => value!(TypePathSegment::NestedType)
-			|
-			3 => value!(TypePathSegment::WildcardBound)
-			|
-			4 => value!(TypePathSegment::TypeArgument(type_argument_index))
-		) >>
-		(segment)
-	));
-}
-
 attr! {
-	struct AnnotationDefault<'a> {
-		default_value: ElementValue<'a> = (pt!(ElementValue))
+	struct AnnotationDefault('a) {
+		default_value: ElementValue<'a>
 	}
 }
 
 table! {
-	struct BootstrapMethods<'a>(be_u16) => struct BootstrapMethod {
-		bootstrap_method_ref: CPIndex<'a, MethodHandleInfo<'a>> = (pt!(CPIndex)),
-		bootstrap_arguments: Vec<CPIndex<'a, LoadableConstant<'a>>> = (length_count!(be_u16, pt!(CPIndex)))
+	@len = "u16";
+	struct BootstrapMethods('a) => struct BootstrapMethod {
+		bootstrap_method_ref: CPIndex<'a, MethodHandleInfo<'a>>,
+		#[binform(len = "u16")]
+		bootstrap_arguments: Vec<CPIndex<'a, LoadableConstant<'a>>>,
 	}
 }
 
@@ -718,80 +767,94 @@ impl<'a> CPType<'a> for LoadableConstant<'a> {
 }
 
 table! {
-	struct MethodParameters<'a>(be_u16) => MethodParameter;
+	@len = "u16";
+	struct MethodParameters('a) => MethodParameter;
 }
 
-parser! {
-	struct MethodParameter<'a> {
-		name_index: Option<CPIndex<'a, UTF8Info<'a>>> = (call!(CPIndex::parse_non_zero)),
-		access_flags: u16 = (be_u16)
+def! {
+	struct MethodParameter('a) {
+		#[binform(read = "CPIndex::read_non_zero", write = "CPIndex::write_non_zero")]
+		name_index: Option<CPIndex<'a, UTF8Info<'a>>>,
+		access_flags: u16
 	}
 }
 
 attr! {
-	struct Module<'a> {
-		module_name_index    : CPIndex<'a, ModuleInfo<'a>>         = (pt!(CPIndex)),
-		module_flags         : u16                                 = (be_u16),
-		module_version_index : Option<CPIndex<'a, ModuleInfo<'a>>> = (call!(CPIndex::parse_non_zero)),
-		requires             : Vec<Requires<'a>>                   = (length_count!(be_u16, pt!(Requires))),
-		exports              : Vec<Exports<'a>>                    = (length_count!(be_u16, pt!(Exports))),
-		opens                : Vec<Opens<'a>>                      = (length_count!(be_u16, pt!(Opens))),
-		uses                 : Vec<CPIndex<'a, ClassInfo<'a>>>     = (length_count!(be_u16, pt!(CPIndex))),
-		provides             : Vec<Provides<'a>>                   = (length_count!(be_u16, pt!(Provides)))
+	struct Module('a) {
+		module_name_index: CPIndex<'a, ModuleInfo<'a>>,
+		module_flags: u16,
+		#[binform(read = "CPIndex::read_non_zero", write = "CPIndex::write_non_zero")]
+		module_version_index : Option<CPIndex<'a, ModuleInfo<'a>>>,
+		#[binform(len = "u16")]
+		requires: Vec<Requires<'a>>,
+		#[binform(len = "u16")]
+		exports: Vec<Exports<'a>>,
+		#[binform(len = "u16")]
+		opens: Vec<Opens<'a>>,
+		#[binform(len = "u16")]
+		uses: Vec<CPIndex<'a, ClassInfo<'a>>>,
+		#[binform(len = "u16")]
+		provides: Vec<Provides<'a>>
 	}
 }
 
-parser! {
-	struct Requires<'a> {
-		requires_index: CPIndex<'a, ModuleInfo<'a>> = (pt!(CPIndex)),
-		requires_flags: u16 = (be_u16),
-		requires_version_index: Option<CPIndex<'a, UTF8Info<'a>>> = (call!(CPIndex::parse_non_zero)),
+def! {
+	struct Requires('a) {
+		requires_index: CPIndex<'a, ModuleInfo<'a>>,
+		requires_flags: u16,
+		#[binform(read = "CPIndex::read_non_zero", write = "CPIndex::write_non_zero")]
+		requires_version_index: Option<CPIndex<'a, UTF8Info<'a>>>,
 	}
 }
 
-parser! {
-	struct Exports<'a> {
-		exports_index: CPIndex<'a, PackageInfo<'a>> = (pt!(CPIndex)),
-		exports_flags: u16 = (be_u16),
-		exports_to: Vec<CPIndex<'a, ModuleInfo<'a>>> = (length_count!(be_u16, pt!(CPIndex)))
+def! {
+	struct Exports('a) {
+		exports_index: CPIndex<'a, PackageInfo<'a>>,
+		exports_flags: u16,
+		#[binform(len = "u16")]
+		exports_to: Vec<CPIndex<'a, ModuleInfo<'a>>>
 	}
 }
 
-parser! {
-	struct Opens<'a> {
-		opens_index: CPIndex<'a, PackageInfo<'a>> = (pt!(CPIndex)),
-		opens_flags: u16 = (be_u16),
-		opens_to: Vec<CPIndex<'a, ModuleInfo<'a>>> = (length_count!(be_u16, pt!(CPIndex)))
+def! {
+	struct Opens('a) {
+		opens_index: CPIndex<'a, PackageInfo<'a>>,
+		opens_flags: u16,
+		#[binform(len = "u16")]
+		opens_to: Vec<CPIndex<'a, ModuleInfo<'a>>>
 	}
 }
 
-parser! {
-	struct Provides<'a> {
-		provides: CPIndex<'a, ClassInfo<'a>> = (pt!(CPIndex)),
-		provides_with: Vec<CPIndex<'a, ClassInfo<'a>>> = (length_count!(be_u16, pt!(CPIndex)))
-	}
-}
-
-attr! {
-	struct ModulePackages<'a> {
-		packages: Vec<CPIndex<'a, PackageInfo<'a>>> = (length_count!(be_u16, pt!(CPIndex)))
-	}
-}
-
-attr! {
-	struct ModuleMainClass<'a> {
-		main_class_index: CPIndex<'a, ClassInfo<'a>> = (pt!(CPIndex))
-	}
-}
-
-attr! {
-	struct NestHost<'a> {
-		host_class_index: CPIndex<'a, ClassInfo<'a>> = (pt!(CPIndex))
+def! {
+	struct Provides('a) {
+		provides: CPIndex<'a, ClassInfo<'a>>,
+		#[binform(len = "u16")]
+		provides_with: Vec<CPIndex<'a, ClassInfo<'a>>>
 	}
 }
 
 attr! {
-	struct NestMembers<'a> {
-		classes: Vec<CPIndex<'a, ClassInfo<'a>>> = (length_count!(be_u16, pt!(CPIndex)))
+	struct ModulePackages('a) {
+		#[binform(len = "u16")]
+		packages: Vec<CPIndex<'a, PackageInfo<'a>>>
+	}
+}
+
+attr! {
+	struct ModuleMainClass('a) {
+		main_class_index: CPIndex<'a, ClassInfo<'a>>
+	}
+}
+
+attr! {
+	struct NestHost('a) {
+		host_class_index: CPIndex<'a, ClassInfo<'a>>
+	}
+}
+
+attr! {
+	struct NestMembers('a) {
+		#[binform(len = "u16")]
+		classes: Vec<CPIndex<'a, ClassInfo<'a>>>
 	}
 }
